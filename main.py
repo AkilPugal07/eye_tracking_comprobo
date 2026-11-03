@@ -17,15 +17,20 @@ detector = vision.FaceLandmarker.create_from_options(options)
 
 cap = cv2.VideoCapture(0)
 
+
 while cap.isOpened():
     success, img = cap.read()
     if not success:
         break
 
+    flipped_img = cv2.flip(
+        img, 1
+    )  # Flip the image horizontally for a selfie-view display
+
     # MediaPipe Tasks expects an mp.Image object
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
-        data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+        data=cv2.cvtColor(flipped_img, cv2.COLOR_BGR2RGB),
     )
 
     # Run face landmark detection
@@ -37,21 +42,21 @@ while cap.isOpened():
             # Draw each landmark point
             for landmark in face_landmarks:
 
-                left_eye = face_landmarks[468]  # Example: Left eye iris landmark index
+                # left_eye = face_landmarks[468]  # Example: Left eye iris landmark index
                 right_eye = face_landmarks[
                     473
                 ]  # Example: Right eye iris landmark index
 
-                left_eye_x = int(left_eye.x * img.shape[1])
-                left_eye_y = int(left_eye.y * img.shape[0])
+                # left_eye_x = int(left_eye.x * img.shape[1])
+                # left_eye_y = int(left_eye.y * img.shape[0])
 
                 right_eye_x = int(right_eye.x * img.shape[1])
                 right_eye_y = int(right_eye.y * img.shape[0])
 
-                cv2.circle(img, (left_eye_x, left_eye_y), 5, (0, 255, 0), -1)
-                cv2.circle(img, (right_eye_x, right_eye_y), 5, (0, 255, 0), -1)
+                # cv2.circle(img, (left_eye_x, left_eye_y), 5, (0, 255, 0), -1)
+                cv2.circle(flipped_img, (right_eye_x, right_eye_y), 5, (0, 255, 0), -1)
 
-    cv2.imshow("Face Mesh", img)
+    cv2.imshow("Face Mesh", flipped_img)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
