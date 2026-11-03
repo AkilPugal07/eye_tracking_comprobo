@@ -42,7 +42,7 @@ while cap.isOpened():
             # Draw each landmark point
             for landmark in face_landmarks:
 
-                # left_eye = face_landmarks[468]  # Example: Left eye iris landmark index
+                left_eye = face_landmarks[468]  # Example: Left eye iris landmark index
                 right_eye = face_landmarks[
                     473
                 ]  # Example: Right eye iris landmark index
@@ -53,8 +53,14 @@ while cap.isOpened():
                 right_eye_x = int(right_eye.x * img.shape[1])
                 right_eye_y = int(right_eye.y * img.shape[0])
 
-                cv2.circle(flipped_img, (left_eye_x, left_eye_y), 5, (0, 255, 0), -1)
-                cv2.circle(flipped_img, (right_eye_x, right_eye_y), 5, (0, 255, 0), -1)
+                # Calculating the center point between the eyes
+                center_point_x = (left_eye_x + right_eye_x) // 2
+                center_point_y = (left_eye_y + right_eye_y) // 2
+
+                # Drawing the center point on the image
+                cv2.circle(
+                    flipped_img, (center_point_x, center_point_y), 5, (0, 255, 0), -1
+                )
 
     cv2.imshow("Face Mesh", flipped_img)
     if cv2.waitKey(1) & 0xFF == ord("q"):
