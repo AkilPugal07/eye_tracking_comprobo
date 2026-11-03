@@ -47,13 +47,13 @@ while cap.isOpened():
                     473
                 ]  # Example: Right eye iris landmark index
 
-                # left_eye_x = int(left_eye.x * img.shape[1])
-                # left_eye_y = int(left_eye.y * img.shape[0])
+                left_eye_x = int(left_eye.x * img.shape[1])
+                left_eye_y = int(left_eye.y * img.shape[0])
 
                 right_eye_x = int(right_eye.x * img.shape[1])
                 right_eye_y = int(right_eye.y * img.shape[0])
 
-                # cv2.circle(img, (left_eye_x, left_eye_y), 5, (0, 255, 0), -1)
+                cv2.circle(flipped_img, (left_eye_x, left_eye_y), 5, (0, 255, 0), -1)
                 cv2.circle(flipped_img, (right_eye_x, right_eye_y), 5, (0, 255, 0), -1)
 
     cv2.imshow("Face Mesh", flipped_img)
