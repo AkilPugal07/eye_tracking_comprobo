@@ -4,28 +4,35 @@ Fit a gaze -> screen mapping from calibration data, and use it live.
 Fit (uses the newest calibration CSV, or one you pass in):
     python gaze_boundary.py
     python gaze_boundary.py calibration_data/calibration_20261104_144608.csv
+    python gaze_boundary.py --eyes-only        # old model without head pose (to compare)
 
 Try it live with the webcam (needs a fitted model first):
     python gaze_boundary.py --live
 
 How it works
 ------------
-1. Gaze features: two numbers per frame from MediaPipe's eye blendshapes,
-   look_right and look_up. Blendshapes measure the eyes relative to the face,
-   so small head movements don't shift them (raw iris positions in the camera
-   image do shift, which is why the iris midpoint doesn't work).
-2. Per target: drop blink frames and take the median -> one point per target.
-3. Fit: least squares on the 9 ON-screen targets only (their labels are exact):
-       screen_x = a*look_right + b*look_up + c
-       screen_y = d*look_right + e*look_up + f
-4. Bounding box: on screen  <=>  0 <= screen_x <= 1  and  0 <= screen_y <= 1
+1. Features per frame:
+     look_right, look_up   from MediaPipe's eye blendshapes (eyes relative to the face)
+     head_yaw, head_pitch  head rotation in degrees, from the head pose matrix
+   Head rotation is needed because when you turn your head while looking at the
+   same spot, your eyes rotate the other way -- eyes alone would then say you're
+   looking somewhere else.
+2. Fit: least squares on every ON-screen frame (not just per-target averages,
+   so the small head movements inside each target teach the head correction):
+       screen_x = a*look_right + b*look_up + c*head_yaw + d*head_pitch + e
+       screen_y = (same shape, own numbers)
+3. Bounding box: on screen  <=>  0 <= screen_x <= 1  and  0 <= screen_y <= 1
    (plus a small margin). The off-screen targets are only used to CHECK the box,
    because their labels (-0.2 / 1.2) are rough guesses.
+4. Live: the position is smoothed with a One Euro filter -- heavy smoothing when
+   the eyes are still (less jitter), light smoothing when they jump (less lag).
 """
 
 import argparse
 import csv
 import json
+import math
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +44,15 @@ MODEL_PATH = CALIBRATION_DIR / "gaze_model.json"
 BLINK_THRESHOLD = 0.5  # eyeBlink score above this = eyes closed, frame is ignored
 DEFAULT_MARGIN = 0.03  # extra room around the screen (fraction of screen size)
 SWITCH_FRAMES = 5      # frames in a row needed to switch on <-> off screen
+
+# One Euro filter settings (tested on the calibration recording):
+#   lower MIN_CUTOFF = less jitter when still, but more lag
+#   higher BETA      = follows fast eye jumps quicker, but a bit more jitter
+FILTER_MIN_CUTOFF = 0.5
+FILTER_BETA = 0.5
+
+EYE_FEATURES = ["look_right", "look_up"]
+HEAD_FEATURES = ["head_yaw", "head_pitch"]
 
 # the blendshapes the gaze features are built from
 BLENDSHAPES_USED = [
@@ -67,11 +83,66 @@ def gaze_features(scores):
     return look_right, look_up
 
 
-def scores_from_result(result):
-    """Blendshape scores from a live MediaPipe result, or None if no face."""
+def head_angles(fx, fy, fz):
+    """Head yaw and pitch in degrees, from the direction the face points.
+
+    (fx, fy, fz) is the third column of the 4x4 head pose matrix
+    (m02, m12, m22): the face's forward axis in camera coordinates.
+    """
+    yaw = math.degrees(math.atan2(fx, fz))
+    pitch = math.degrees(math.atan2(fy, math.hypot(fx, fz)))
+    return yaw, pitch
+
+
+def features_from_result(result):
+    """Live MediaPipe result -> dict of all features, or None if no face / blinking."""
     if result is None or not result.face_blendshapes:
         return None
-    return {shape.category_name: shape.score for shape in result.face_blendshapes[0]}
+    scores = {shape.category_name: shape.score for shape in result.face_blendshapes[0]}
+    if is_blinking(scores):
+        return None
+    feats = dict(zip(EYE_FEATURES, gaze_features(scores)))
+    if result.facial_transformation_matrixes:
+        m = np.asarray(result.facial_transformation_matrixes[0])
+        feats.update(zip(HEAD_FEATURES, head_angles(m[0, 2], m[1, 2], m[2, 2])))
+    return feats
+
+
+# ---------------------------------------------------------------- smoothing
+
+class OneEuroFilter:
+    """Adaptive low-pass filter for one number (Casiez et al., 2012).
+
+    Smooths a lot when the value barely changes (removes jitter), and less
+    when it changes fast (so quick eye jumps don't lag behind).
+    """
+
+    def __init__(self, min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self._t = None
+        self._x = None
+        self._dx = 0.0
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self._t is None:
+            self._t, self._x = t, x
+            return x
+        dt = max(t - self._t, 1e-3)
+        self._t = t
+        # how fast is the value changing? (itself smoothed)
+        a_d = self._alpha(dt, self.d_cutoff)
+        self._dx = a_d * (x - self._x) / dt + (1 - a_d) * self._dx
+        # faster change -> higher cutoff -> less smoothing
+        a = self._alpha(dt, self.min_cutoff + self.beta * abs(self._dx))
+        self._x = a * x + (1 - a) * self._x
+        return self._x
 
 
 # ---------------------------------------------------------------- fitting
@@ -84,7 +155,7 @@ def newest_calibration_csv():
 
 
 def load_frames(csv_path):
-    """Read the calibration CSV -> list of frames with gaze features.
+    """Read the calibration CSV -> list of frames with all features.
 
     Skips frames with no face and frames where the user blinked.
     """
@@ -99,49 +170,42 @@ def load_frames(csv_path):
             if is_blinking(scores):
                 blinks += 1
                 continue
-            look_right, look_up = gaze_features(scores)
-            frames.append({
+            frame = {
                 "label": row["label"],
                 "x": float(row["x"]),
                 "y": float(row["y"]),
                 "on_screen": row["on_screen"] == "1",
-                "look_right": look_right,
-                "look_up": look_up,
-            })
-    print(f"Loaded {len(frames)} frames (skipped {no_face} with no face, {blinks} blinks)")
+                "head_move": row.get("head_move") == "1",
+            }
+            frame.update(zip(EYE_FEATURES, gaze_features(scores)))
+            frame.update(zip(HEAD_FEATURES, head_angles(
+                float(row["head_m02"]), float(row["head_m12"]), float(row["head_m22"]))))
+            frames.append(frame)
+    n_head = sum(f["head_move"] for f in frames)
+    print(f"Loaded {len(frames)} frames (skipped {no_face} with no face, {blinks} blinks)"
+          + (f", {n_head} from the head-movement part" if n_head else ""))
+    if not n_head:
+        print("  (No head-movement part in this file -- the head correction is only roughly")
+        print("   learned. Re-run calibration.py to record one.)")
     return frames
 
 
-def per_target_medians(frames):
-    """One point per target: the median gaze features of its frames."""
-    targets = {}
-    for fr in frames:
-        targets.setdefault(fr["label"], []).append(fr)
-    out = []
-    for label, frs in targets.items():  # dicts keep insertion order = recording order
-        out.append({
-            "label": label,
-            "x": frs[0]["x"],
-            "y": frs[0]["y"],
-            "on_screen": frs[0]["on_screen"],
-            "look_right": float(np.median([f["look_right"] for f in frs])),
-            "look_up": float(np.median([f["look_up"] for f in frs])),
-            "frames": len(frs),
-        })
-    return out
+def design_row(feats, feature_names):
+    """Feature values in model order, plus a 1 for the constant term."""
+    return [feats[n] for n in feature_names] + [1.0]
 
 
-def fit_mapping(targets):
-    """Least-squares fit of screen_x and screen_y from the ON-screen targets.
+def fit_mapping(frames, feature_names):
+    """Least-squares fit of screen_x and screen_y from every ON-screen frame.
 
-    Returns (coef_x, coef_y), each [a, b, c] for  a*look_right + b*look_up + c.
+    Returns (coef_x, coef_y): one number per feature, then the constant.
     """
-    on = [t for t in targets if t["on_screen"]]
-    if len(on) < 3:
+    on = [f for f in frames if f["on_screen"]]
+    if len({f["label"] for f in on}) < 3:
         raise SystemExit("Need at least 3 on-screen targets to fit.")
-    A = np.array([[t["look_right"], t["look_up"], 1.0] for t in on])
-    coef_x, *_ = np.linalg.lstsq(A, np.array([t["x"] for t in on]), rcond=None)
-    coef_y, *_ = np.linalg.lstsq(A, np.array([t["y"] for t in on]), rcond=None)
+    A = np.array([design_row(f, feature_names) for f in on])
+    coef_x, *_ = np.linalg.lstsq(A, np.array([f["x"] for f in on]), rcond=None)
+    coef_y, *_ = np.linalg.lstsq(A, np.array([f["y"] for f in on]), rcond=None)
     return coef_x, coef_y
 
 
@@ -164,37 +228,42 @@ class GazeMapper:
             px, py = out["x"] * screen_w, out["y"] * screen_h
 
     The image must be flipped the same way as during calibration
-    (calibration.py and main.py both flip it).
+    (calibration.py and main.py both flip it), and for the head features the
+    detector needs output_facial_transformation_matrixes=True
+    (calibration.FaceTracker has that).
     """
 
-    def __init__(self, coef_x, coef_y, margin=DEFAULT_MARGIN,
-                 switch_frames=SWITCH_FRAMES, smoothing=0.5):
+    def __init__(self, coef_x, coef_y, features=EYE_FEATURES, margin=DEFAULT_MARGIN,
+                 switch_frames=SWITCH_FRAMES, min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA):
         self.coef_x = np.asarray(coef_x, dtype=float)
         self.coef_y = np.asarray(coef_y, dtype=float)
+        self.features = list(features)
         self.margin = margin
         self.switch_frames = switch_frames
-        self.smoothing = smoothing  # 0 = raw, closer to 1 = smoother but laggier
+        self._filter_x = OneEuroFilter(min_cutoff, beta)
+        self._filter_y = OneEuroFilter(min_cutoff, beta)
 
         self.on_screen = True  # current (debounced) state
         self._disagree = 0     # frames in a row that disagree with the state
-        self._xy = None        # smoothed position
 
     @classmethod
     def load(cls, path=MODEL_PATH, **kwargs):
         model = json.loads(Path(path).read_text())
         kwargs.setdefault("margin", model.get("margin", DEFAULT_MARGIN))
+        # older models (before head pose was added) only used the eye features
+        kwargs.setdefault("features", model.get("features_used", EYE_FEATURES))
         return cls(model["coef_x"], model["coef_y"], **kwargs)
 
-    def to_screen(self, look_right, look_up):
-        """Gaze features -> screen position as fractions (0..1 = on screen)."""
-        v = np.array([look_right, look_up, 1.0])
+    def to_screen(self, feats):
+        """Feature dict -> screen position as fractions (0..1 = on screen)."""
+        v = np.array(design_row(feats, self.features))
         return float(self.coef_x @ v), float(self.coef_y @ v)
 
     def is_inside(self, x, y):
         m = self.margin
         return -m <= x <= 1 + m and -m <= y <= 1 + m
 
-    def update(self, result):
+    def update(self, result, t=None):
         """Feed one MediaPipe result. Returns None if no face or blinking,
         otherwise {"x", "y", "on_screen", "inside_now"}.
 
@@ -203,18 +272,15 @@ class GazeMapper:
         on_screen  debounced: only flips after SWITCH_FRAMES frames in a row,
                    so it doesn't flicker at the edges
         """
-        scores = scores_from_result(result)
-        if scores is None or is_blinking(scores):
+        feats = features_from_result(result)
+        if feats is None or any(n not in feats for n in self.features):
             return None
 
-        x, y = self.to_screen(*gaze_features(scores))
-        if self._xy is None:
-            self._xy = (x, y)
-        else:
-            s = self.smoothing
-            self._xy = (s * self._xy[0] + (1 - s) * x, s * self._xy[1] + (1 - s) * y)
+        t = time.monotonic() if t is None else t
+        raw_x, raw_y = self.to_screen(feats)
+        x, y = self._filter_x(raw_x, t), self._filter_y(raw_y, t)
 
-        inside_now = self.is_inside(*self._xy)
+        inside_now = self.is_inside(x, y)
         if inside_now != self.on_screen:
             self._disagree += 1
             if self._disagree >= self.switch_frames:
@@ -223,13 +289,12 @@ class GazeMapper:
         else:
             self._disagree = 0
 
-        return {"x": self._xy[0], "y": self._xy[1],
-                "on_screen": self.on_screen, "inside_now": inside_now}
+        return {"x": x, "y": y, "on_screen": self.on_screen, "inside_now": inside_now}
 
 
 # ---------------------------------------------------------------- report
 
-def evaluate(frames, targets, mapper):
+def evaluate(frames, mapper):
     """Print how well the box separates on- and off-screen, and return a summary."""
     print("\nPer target (median predicted position, % of frames classified correctly):")
     print(f"  {'label':22s} {'true (x, y)':>13s}   {'predicted':>13s}   correct")
@@ -239,59 +304,65 @@ def evaluate(frames, targets, mapper):
 
     summary = []
     weak = []
-    for t in targets:
-        preds = [mapper.to_screen(f["look_right"], f["look_up"]) for f in by_label[t["label"]]]
-        correct = np.mean([mapper.is_inside(px, py) == t["on_screen"] for px, py in preds])
+    for label, frs in by_label.items():
+        t = frs[0]
+        preds = [mapper.to_screen(f) for f in frs]
+        correct = float(np.mean([mapper.is_inside(px, py) == t["on_screen"] for px, py in preds]))
         px = float(np.median([p[0] for p in preds]))
         py = float(np.median([p[1] for p in preds]))
         flag = "" if correct >= 0.9 else "   <-- weak"
-        print(f"  {t['label']:22s} ({t['x']:4.1f}, {t['y']:4.1f})   ({px:5.2f}, {py:5.2f})   {correct:6.1%}{flag}")
-        summary.append({**t, "pred_x": px, "pred_y": py, "correct": float(correct)})
+        print(f"  {label:22s} ({t['x']:4.2g}, {t['y']:4.2g})   ({px:5.2f}, {py:5.2f})   {correct:6.1%}{flag}")
+        summary.append({"label": label, "x": t["x"], "y": t["y"], "on_screen": t["on_screen"],
+                        "pred_x": px, "pred_y": py, "correct": correct, "frames": len(frs)})
         if correct < 0.9:
             weak.append(t)
 
-    on_frames = [f for f in frames if f["on_screen"]]
-    off_frames = [f for f in frames if not f["on_screen"]]
-    on_acc = np.mean([mapper.is_inside(*mapper.to_screen(f["look_right"], f["look_up"])) for f in on_frames])
-    off_acc = np.mean([not mapper.is_inside(*mapper.to_screen(f["look_right"], f["look_up"])) for f in off_frames]) \
-        if off_frames else float("nan")
+    inside = [mapper.is_inside(*mapper.to_screen(f)) for f in frames]
+    on_acc = float(np.mean([i for i, f in zip(inside, frames) if f["on_screen"]]))
+    off = [not i for i, f in zip(inside, frames) if not f["on_screen"]]
+    off_acc = float(np.mean(off)) if off else float("nan")
     print(f"\nOn-screen frames classified ON:   {on_acc:.1%}")
     print(f"Off-screen frames classified OFF: {off_acc:.1%}")
 
     if weak:
         print("\nWeak spots (under 90% correct):")
         for t in weak:
-            where = describe_position(t["x"], t["y"])
-            print(f"  - {t['label']} ({where})")
+            print(f"  - {t['label']} ({describe_position(t['x'], t['y'])})")
         if any(t["y"] < 0 for t in weak):
             print("  Looking ABOVE the screen looks too similar to the top row of dots.")
             print("  Try re-calibrating with a sticky note well above the screen to look at,")
-            print("  or use a bigger margin for the top edge.")
-    return summary, float(on_acc), float(off_acc)
+            print("  or use a bigger margin.")
+    return summary, on_acc, off_acc
 
 
-def fit_and_save(csv_path, margin):
+def fit_and_save(csv_path, margin, use_head=True):
     print(f"Calibration file: {csv_path}")
     frames = load_frames(csv_path)
-    targets = per_target_medians(frames)
-    coef_x, coef_y = fit_mapping(targets)
+    feature_names = EYE_FEATURES + (HEAD_FEATURES if use_head else [])
+    coef_x, coef_y = fit_mapping(frames, feature_names)
+    mapper = GazeMapper(coef_x, coef_y, features=feature_names, margin=margin)
 
-    mapper = GazeMapper(coef_x, coef_y, margin=margin)
-    on = [t for t in targets if t["on_screen"]]
-    err = max(max(abs(mapper.to_screen(t["look_right"], t["look_up"])[0] - t["x"]),
-                  abs(mapper.to_screen(t["look_right"], t["look_up"])[1] - t["y"])) for t in on)
-    print(f"\nFit on {len(on)} on-screen targets: worst error {err:.3f} of the screen size")
-    print(f"  screen_x = {coef_x[0]:+.3f}*look_right {coef_x[1]:+.3f}*look_up {coef_x[2]:+.3f}")
-    print(f"  screen_y = {coef_y[0]:+.3f}*look_right {coef_y[1]:+.3f}*look_up {coef_y[2]:+.3f}")
+    # fit quality: error of each on-screen target's median prediction
+    errs = []
+    for label in dict.fromkeys(f["label"] for f in frames if f["on_screen"]):
+        frs = [f for f in frames if f["label"] == label]
+        preds = np.array([mapper.to_screen(f) for f in frs])
+        errs.append(max(abs(np.median(preds[:, 0]) - frs[0]["x"]), abs(np.median(preds[:, 1]) - frs[0]["y"])))
+    err = float(max(errs))
+
+    print(f"\nFit using {', '.join(feature_names)}: worst on-screen target error {err:.3f} of the screen")
+    for axis, coef in (("x", coef_x), ("y", coef_y)):
+        terms = " ".join(f"{c:+.3f}*{n}" for c, n in zip(coef, feature_names))
+        print(f"  screen_{axis} = {terms} {coef[-1]:+.3f}")
     print(f"  on screen if both are between {-margin:.2f} and {1 + margin:.2f}")
 
-    summary, on_acc, off_acc = evaluate(frames, targets, mapper)
+    summary, on_acc, off_acc = evaluate(frames, mapper)
 
     MODEL_PATH.parent.mkdir(exist_ok=True)
     MODEL_PATH.write_text(json.dumps({
         "created": datetime.now().isoformat(timespec="seconds"),
         "source_csv": Path(csv_path).name,
-        "features": "look_right, look_up from eye blendshapes (see gaze_features)",
+        "features_used": feature_names,
         "coef_x": coef_x.tolist(),
         "coef_y": coef_y.tolist(),
         "margin": margin,
@@ -354,6 +425,8 @@ def main():
     parser = argparse.ArgumentParser(description="Fit / test the gaze -> screen boundary.")
     parser.add_argument("csv", nargs="?", help="calibration CSV (default: newest one)")
     parser.add_argument("--live", action="store_true", help="test the saved model with the webcam")
+    parser.add_argument("--eyes-only", action="store_true",
+                        help="fit without head pose (the old model), to compare")
     parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN,
                         help=f"extra room around the screen, fraction (default {DEFAULT_MARGIN})")
     args = parser.parse_args()
@@ -361,7 +434,7 @@ def main():
     if args.live:
         run_live(args.margin)
     else:
-        fit_and_save(args.csv or newest_calibration_csv(), args.margin)
+        fit_and_save(args.csv or newest_calibration_csv(), args.margin, use_head=not args.eyes_only)
 
 
 if __name__ == "__main__":

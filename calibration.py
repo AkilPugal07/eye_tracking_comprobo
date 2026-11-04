@@ -31,6 +31,12 @@ RECORD_SECONDS = 3.0  # data is recorded for this long; the ring shrinks over it
 SETTLE_SECONDS = 1.0             # on-screen: move eyes to the dot
 OFF_SCREEN_SETTLE_SECONDS = 2.5  # off-screen: read the arrow + look away
 
+# Head-movement part: look at a dot while slowly moving the head. This teaches
+# gaze_boundary.py how much head rotation changes the eye readings, so the
+# cursor stays put when you move your head.
+HEAD_MOVE_SECONDS = 6.0
+HEAD_MOVE_POINTS = [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
+
 WINDOW = "Calibration"
 
 
@@ -220,23 +226,33 @@ def show_message(screen_size, lines):
             return False  # window was closed with the X button
 
 
+def build_head_move_targets():
+    """On-screen dots to look at while slowly moving the head."""
+    return [{"label": f"head_move_{x}_{y}", "x": x, "y": y, "on_screen": True,
+             "head_move": True, "record_seconds": HEAD_MOVE_SECONDS}
+            for x, y in HEAD_MOVE_POINTS]
+
+
 def run_target(tracker, screen_size, target, rows):
-    """Show one target for RECORD_SECONDS, appending one row per frame to `rows`.
+    """Show one target for RECORD_SECONDS (or the target's own "record_seconds"),
+    appending one row per frame to `rows`.
     Return False if the user pressed ESC so main() can stop.
 
     """
     w, h = screen_size
     settle = SETTLE_SECONDS if target["on_screen"] else OFF_SCREEN_SETTLE_SECONDS
+    duration = target.get("record_seconds", RECORD_SECONDS)
+    head_move = target.get("head_move", False)
     start = time.monotonic()
 
     while True:
         elapsed = time.monotonic() - start
-        if elapsed >= settle + RECORD_SECONDS:
+        if elapsed >= settle + duration:
             break
         recording = elapsed >= settle
 
-        # 0 during the settle phase, then 0 -> 1 over the RECORD_SECONDS
-        progress = min(max((elapsed - settle) / RECORD_SECONDS, 0.0), 1.0)
+        # 0 during the settle phase, then 0 -> 1 over the recording time
+        progress = min(max((elapsed - settle) / duration, 0.0), 1.0)
 
         frame, result = tracker.read()
         face_found = result is not None and bool(result.face_landmarks)
@@ -247,6 +263,7 @@ def run_target(tracker, screen_size, target, rows):
                 "x": target["x"],
                 "y": target["y"],
                 "on_screen": int(target["on_screen"]),
+                "head_move": int(head_move),
                 "t": round(elapsed - settle, 4),  # seconds into the recording
                 "face_detected": int(face_found),
             }
@@ -262,7 +279,12 @@ def run_target(tracker, screen_size, target, rows):
         else:
             draw_off_screen_target(canvas, target, progress)
 
-        # only warn before recording, so the text doesn't pull the eyes away mid-recording
+        # only show text before recording, so it doesn't pull the eyes away mid-recording
+        if head_move and not recording:
+            text = "Keep your eyes on the dot and slowly move your head around"
+            (text_w, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+            cv2.putText(canvas, text, (w // 2 - text_w // 2, h - 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         if not face_found and not recording:
             cv2.putText(canvas, "No face detected - check the camera", (30, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
@@ -314,7 +336,10 @@ def save(rows, info):
 
 def main():
     screen_size = get_screen_size()
-    targets = build_targets()
+    # order: 9 on-screen dots -> 5 head-movement dots -> 8 off-screen targets
+    basic = build_targets()
+    targets = ([t for t in basic if t["on_screen"]] + build_head_move_targets()
+               + [t for t in basic if not t["on_screen"]])
     tracker = FaceTracker()
 
     info = {
@@ -326,6 +351,7 @@ def main():
         "record_seconds": RECORD_SECONDS,
         "settle_seconds": SETTLE_SECONDS,
         "off_screen_settle_seconds": OFF_SCREEN_SETTLE_SECONDS,
+        "head_move_seconds": HEAD_MOVE_SECONDS,
         "targets_total": len(targets),
         "targets_completed": 0,
     }
@@ -346,13 +372,28 @@ def main():
         ])
 
         if started:
+            head_intro_shown = False
             off_screen_intro_shown = False
             for target in targets:
+                # pause once before the head-movement part to explain it
+                if target.get("head_move") and not head_intro_shown:
+                    head_intro_shown = True
+                    if not show_message(screen_size, [
+                        "Part 2: head movement",
+                        "",
+                        "Keep your eyes on the dot the whole time, but slowly move",
+                        "your HEAD: turn left and right, tilt up and down, lean a bit.",
+                        "Small, slow movements -- like you would while using the computer.",
+                        "",
+                        "Press SPACE to continue, ESC to quit.",
+                    ]):
+                        break
+
                 # pause once before the off-screen part to explain it
                 if not target["on_screen"] and not off_screen_intro_shown:
                     off_screen_intro_shown = True
                     if not show_message(screen_size, [
-                        "Part 2: off-screen targets",
+                        "Part 3: off-screen targets",
                         "",
                         "An arrow will point off the edge of the screen.",
                         "Look about 1 inch past the arrow tip, off the screen,",

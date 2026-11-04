@@ -25,8 +25,15 @@ from calibration import FaceTracker  # same camera + detector setup (and flip) a
 from gaze_boundary import MODEL_PATH, GazeMapper
 
 SENSITIVITY = 1.0  # >1 stretches eye movement so the screen edges are easier to reach
-SMOOTHING = 0.7    # 0 = raw (jittery), closer to 1 = smoother but laggier
-MIN_MOVE_PX = 8    # don't move the cursor for changes smaller than this (less jitter)
+
+# Smoothing (One Euro filter, see gaze_boundary.py):
+FILTER_MIN_CUTOFF = 0.5  # lower = steadier when looking at one spot, but laggier
+FILTER_BETA = 0.5        # higher = follows quick eye jumps faster, but jitterier
+
+# "Sticky" cursor: it stays still until your gaze moves more than this many
+# pixels away from it. Your gaze naturally wobbles ~30 px while staring at one
+# spot, so this keeps the cursor from creeping around.
+MIN_MOVE_PX = 50
 
 GREEN, RED, ORANGE, WHITE = (0, 200, 0), (0, 0, 255), (0, 165, 255), (255, 255, 255)
 
@@ -36,7 +43,7 @@ def main():
         raise SystemExit("No gaze model found. Run `python calibration.py` and then "
                          "`python gaze_boundary.py` first.")
 
-    mapper = GazeMapper.load(smoothing=SMOOTHING)
+    mapper = GazeMapper.load(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
     screen_w, screen_h = pyautogui.size()  # real pixels (ignores Windows display scaling)
     screen = mouse_movement.MouseMovement(screen_w, screen_h, SENSITIVITY, MIN_MOVE_PX)
     tracker = FaceTracker()
