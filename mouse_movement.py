@@ -24,3 +24,17 @@ class MouseMovement:
         scaled_y = max(0, min(self.screen_height - 1, scaled_y))
 
         pyautogui.moveTo(scaled_x, scaled_y)
+
+    def right_click(self, has_closed_right_eye):
+        """
+        Perform a right-click if the right eye is closed.
+        """
+        if has_closed_right_eye:
+            pyautogui.click(button="right")
+
+    def left_click(self, has_closed_left_eye):
+        """
+        Perform a left-click if the left eye is closed.
+        """
+        if has_closed_left_eye:
+            pyautogui.click(button="left")
