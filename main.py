@@ -19,11 +19,11 @@ detector = vision.FaceLandmarker.create_from_options(options)
 cap = cv2.VideoCapture(0)
 
 
-screen_width = 1920  # Example screen width
-screen_height = 1080  # Example screen height
-sensitivity = 1.0  # Adjust sensitivity as needed
+SCREEN_WIDTH = 1920  # Example screen width
+SCREEN_HEIGHT = 1080  # Example screen height
+SENSITIVITY = 1.5  # Adjust sensitivity as needed
 
-screen = mouse_movement.MouseMovement(screen_width, screen_height, sensitivity)
+screen = mouse_movement.MouseMovement(SCREEN_WIDTH, SCREEN_HEIGHT, SENSITIVITY)
 
 
 while cap.isOpened():
@@ -66,10 +66,10 @@ while cap.isOpened():
                 center_point_y = (left_eye_y + right_eye_y) // 2
 
                 # Drawing the center point on the image
-                cv2.circle(
-                    flipped_img, (center_point_x, center_point_y), 5, (0, 255, 0), -1
-                )
+                cv2.circle(flipped_img, (right_eye_x, right_eye_y), 5, (0, 255, 0), -1)
 
+    # Testing mouse movement class
+    # screen.move_mouse(right_eye_x * 2, right_eye_y * 2)
     cv2.imshow("Face Mesh", flipped_img)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
