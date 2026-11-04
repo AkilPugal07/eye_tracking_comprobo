@@ -18,9 +18,14 @@ How it works
    same spot, your eyes rotate the other way -- eyes alone would then say you're
    looking somewhere else.
 2. Fit: least squares on every ON-screen frame (not just per-target averages,
-   so the small head movements inside each target teach the head correction):
-       screen_x = a*look_right + b*look_up + c*head_yaw + d*head_pitch + e
-       screen_y = (same shape, own numbers)
+   so head movements during calibration teach the head correction).
+   The default model is curved (quadratic): besides
+       screen_x = a*look_right + b*look_up + c*head_yaw + d*head_pitch + ...
+   it also has squares and products (look_right*head_yaw, head_yaw**2, ...).
+   A straight line only works for small head turns; with bigger ones the
+   relationship bends. (--linear fits the straight-line model, to compare.)
+   Tested alternatives that did NOT help: iris position relative to the nose,
+   nose bridge, brows, forehead, chin, face sides, eye corners, whole face.
 3. Bounding box: on screen  <=>  0 <= screen_x <= 1  and  0 <= screen_y <= 1
    (plus a small margin). The off-screen targets are only used to CHECK the box,
    because their labels (-0.2 / 1.2) are rough guesses.
@@ -190,23 +195,42 @@ def load_frames(csv_path):
     return frames
 
 
-def design_row(feats, feature_names):
-    """Feature values in model order, plus a 1 for the constant term."""
-    return [feats[n] for n in feature_names] + [1.0]
+def design_row(feats, feature_names, center=None, degree=1):
+    """The model's input terms for one frame.
+
+    degree 1 (straight-line model): the features, then a 1 for the constant.
+    degree 2 (curved model): also every square and pair product, e.g.
+        look_right**2, look_right*head_yaw, ... -- this lets the fit bend, which
+        matters once the head turns more than a few degrees.
+    Features are centered first (minus their typical value) so the squares
+    measure "how far from normal" rather than raw size.
+    """
+    center = center or {}
+    base = [feats[n] - center.get(n, 0.0) for n in feature_names]
+    terms = list(base)
+    if degree >= 2:
+        for i in range(len(base)):
+            for j in range(i, len(base)):
+                terms.append(base[i] * base[j])
+    return terms + [1.0]
 
 
-def fit_mapping(frames, feature_names):
+def fit_mapping(frames, feature_names, degree=2):
     """Least-squares fit of screen_x and screen_y from every ON-screen frame.
 
-    Returns (coef_x, coef_y): one number per feature, then the constant.
+    Returns (coef_x, coef_y, center): one coefficient per model term (see
+    design_row), and the typical value of each feature (the median while
+    looking at the normal dots with the head still).
     """
     on = [f for f in frames if f["on_screen"]]
     if len({f["label"] for f in on}) < 3:
         raise SystemExit("Need at least 3 on-screen targets to fit.")
-    A = np.array([design_row(f, feature_names) for f in on])
+    still = [f for f in on if not f["head_move"]] or on
+    center = {n: float(np.median([f[n] for f in still])) for n in feature_names}
+    A = np.array([design_row(f, feature_names, center, degree) for f in on])
     coef_x, *_ = np.linalg.lstsq(A, np.array([f["x"] for f in on]), rcond=None)
     coef_y, *_ = np.linalg.lstsq(A, np.array([f["y"] for f in on]), rcond=None)
-    return coef_x, coef_y
+    return coef_x, coef_y, center
 
 
 def describe_position(x, y):
@@ -233,11 +257,14 @@ class GazeMapper:
     (calibration.FaceTracker has that).
     """
 
-    def __init__(self, coef_x, coef_y, features=EYE_FEATURES, margin=DEFAULT_MARGIN,
-                 switch_frames=SWITCH_FRAMES, min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA):
+    def __init__(self, coef_x, coef_y, features=EYE_FEATURES, center=None, degree=1,
+                 margin=DEFAULT_MARGIN, switch_frames=SWITCH_FRAMES,
+                 min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA):
         self.coef_x = np.asarray(coef_x, dtype=float)
         self.coef_y = np.asarray(coef_y, dtype=float)
         self.features = list(features)
+        self.center = dict(center or {})
+        self.degree = degree
         self.margin = margin
         self.switch_frames = switch_frames
         self._filter_x = OneEuroFilter(min_cutoff, beta)
@@ -250,13 +277,15 @@ class GazeMapper:
     def load(cls, path=MODEL_PATH, **kwargs):
         model = json.loads(Path(path).read_text())
         kwargs.setdefault("margin", model.get("margin", DEFAULT_MARGIN))
-        # older models (before head pose was added) only used the eye features
+        # older models (before head pose / the curved model) default to the old behavior
         kwargs.setdefault("features", model.get("features_used", EYE_FEATURES))
+        kwargs.setdefault("center", model.get("center", {}))
+        kwargs.setdefault("degree", model.get("degree", 1))
         return cls(model["coef_x"], model["coef_y"], **kwargs)
 
     def to_screen(self, feats):
         """Feature dict -> screen position as fractions (0..1 = on screen)."""
-        v = np.array(design_row(feats, self.features))
+        v = np.array(design_row(feats, self.features, self.center, self.degree))
         return float(self.coef_x @ v), float(self.coef_y @ v)
 
     def is_inside(self, x, y):
@@ -321,7 +350,18 @@ def evaluate(frames, mapper):
     on_acc = float(np.mean([i for i, f in zip(inside, frames) if f["on_screen"]]))
     off = [not i for i, f in zip(inside, frames) if not f["on_screen"]]
     off_acc = float(np.mean(off)) if off else float("nan")
-    print(f"\nOn-screen frames classified ON:   {on_acc:.1%}")
+
+    def typical_error(group):  # median distance from the true target, as % of the screen
+        errs = [math.hypot(px - f["x"], py - f["y"])
+                for f in group for px, py in [mapper.to_screen(f)]]
+        return float(np.median(errs)) if errs else float("nan")
+    still_err = typical_error([f for f in frames if f["on_screen"] and not f["head_move"]])
+    move_err = typical_error([f for f in frames if f["head_move"]])
+
+    print(f"\nTypical error, head still:  {still_err:.1%} of the screen")
+    if not math.isnan(move_err):
+        print(f"Typical error, head moving: {move_err:.1%} of the screen")
+    print(f"On-screen frames classified ON:   {on_acc:.1%}")
     print(f"Off-screen frames classified OFF: {off_acc:.1%}")
 
     if weak:
@@ -335,12 +375,13 @@ def evaluate(frames, mapper):
     return summary, on_acc, off_acc
 
 
-def fit_and_save(csv_path, margin, use_head=True):
+def fit_and_save(csv_path, margin, use_head=True, degree=2):
     print(f"Calibration file: {csv_path}")
     frames = load_frames(csv_path)
     feature_names = EYE_FEATURES + (HEAD_FEATURES if use_head else [])
-    coef_x, coef_y = fit_mapping(frames, feature_names)
-    mapper = GazeMapper(coef_x, coef_y, features=feature_names, margin=margin)
+    coef_x, coef_y, center = fit_mapping(frames, feature_names, degree)
+    mapper = GazeMapper(coef_x, coef_y, features=feature_names, center=center,
+                        degree=degree, margin=margin)
 
     # fit quality: error of each on-screen target's median prediction
     errs = []
@@ -350,10 +391,13 @@ def fit_and_save(csv_path, margin, use_head=True):
         errs.append(max(abs(np.median(preds[:, 0]) - frs[0]["x"]), abs(np.median(preds[:, 1]) - frs[0]["y"])))
     err = float(max(errs))
 
-    print(f"\nFit using {', '.join(feature_names)}: worst on-screen target error {err:.3f} of the screen")
-    for axis, coef in (("x", coef_x), ("y", coef_y)):
-        terms = " ".join(f"{c:+.3f}*{n}" for c, n in zip(coef, feature_names))
-        print(f"  screen_{axis} = {terms} {coef[-1]:+.3f}")
+    shape = "curved (quadratic)" if degree >= 2 else "straight-line"
+    print(f"\n{shape} fit using {', '.join(feature_names)} ({len(coef_x)} terms)")
+    print(f"  worst on-screen target error {err:.3f} of the screen")
+    if degree == 1:
+        for axis, coef in (("x", coef_x), ("y", coef_y)):
+            terms = " ".join(f"{c:+.3f}*{n}" for c, n in zip(coef, feature_names))
+            print(f"  screen_{axis} = {terms} {coef[-1]:+.3f}")
     print(f"  on screen if both are between {-margin:.2f} and {1 + margin:.2f}")
 
     summary, on_acc, off_acc = evaluate(frames, mapper)
@@ -363,6 +407,8 @@ def fit_and_save(csv_path, margin, use_head=True):
         "created": datetime.now().isoformat(timespec="seconds"),
         "source_csv": Path(csv_path).name,
         "features_used": feature_names,
+        "degree": degree,
+        "center": center,
         "coef_x": coef_x.tolist(),
         "coef_y": coef_y.tolist(),
         "margin": margin,
@@ -426,7 +472,9 @@ def main():
     parser.add_argument("csv", nargs="?", help="calibration CSV (default: newest one)")
     parser.add_argument("--live", action="store_true", help="test the saved model with the webcam")
     parser.add_argument("--eyes-only", action="store_true",
-                        help="fit without head pose (the old model), to compare")
+                        help="fit without head pose, to compare")
+    parser.add_argument("--linear", action="store_true",
+                        help="straight-line model instead of the curved one, to compare")
     parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN,
                         help=f"extra room around the screen, fraction (default {DEFAULT_MARGIN})")
     args = parser.parse_args()
@@ -434,7 +482,8 @@ def main():
     if args.live:
         run_live(args.margin)
     else:
-        fit_and_save(args.csv or newest_calibration_csv(), args.margin, use_head=not args.eyes_only)
+        fit_and_save(args.csv or newest_calibration_csv(), args.margin,
+                     use_head=not args.eyes_only, degree=1 if args.linear else 2)
 
 
 if __name__ == "__main__":
