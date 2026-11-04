@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+import mouse_movement
 
 # 1. Download a face landmarker model bundle if you haven't already:
 # https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
@@ -16,6 +17,13 @@ options = vision.FaceLandmarkerOptions(
 detector = vision.FaceLandmarker.create_from_options(options)
 
 cap = cv2.VideoCapture(0)
+
+
+screen_width = 1920  # Example screen width
+screen_height = 1080  # Example screen height
+sensitivity = 1.0  # Adjust sensitivity as needed
+
+screen = mouse_movement.MouseMovement(screen_width, screen_height, sensitivity)
 
 
 while cap.isOpened():
