@@ -1,8 +1,8 @@
 {
-  "created": "2026-11-04T14:44:29",
+  "created": "2026-11-07T13:20:55",
   "screen_size": [
-    1536,
-    960
+    1920,
+    1200
   ],
   "camera_size": [
     640,
@@ -12,6 +12,7 @@
   "record_seconds": 3.0,
   "settle_seconds": 1.0,
   "off_screen_settle_seconds": 2.5,
-  "targets_total": 17,
-  "targets_completed": 17
+  "head_move_seconds": 6.0,
+  "targets_total": 22,
+  "targets_completed": 22
 }

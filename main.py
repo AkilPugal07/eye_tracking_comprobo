@@ -21,31 +21,47 @@ import cv2
 import pyautogui
 
 import mouse_movement
-from calibration import FaceTracker  # same camera + detector setup (and flip) as calibration
+from calibration import (
+    FaceTracker,
+)  # same camera + detector setup (and flip) as calibration
 from gaze_boundary import MODEL_PATH, GazeMapper
 
 SENSITIVITY = 1.0  # >1 stretches eye movement so the screen edges are easier to reach
 
 # Smoothing (One Euro filter, see gaze_boundary.py):
 FILTER_MIN_CUTOFF = 0.5  # lower = steadier when looking at one spot, but laggier
-FILTER_BETA = 0.5        # higher = follows quick eye jumps faster, but jitterier
+FILTER_BETA = 0.5  # higher = follows quick eye jumps faster, but jitterier
 
 # "Sticky" cursor: it stays still until your gaze moves more than this many
 # pixels away from it. Your gaze naturally wobbles ~30 px while staring at one
 # spot, so this keeps the cursor from creeping around.
-MIN_MOVE_PX = 50
+MIN_MOVE_PX = 25
 
 GREEN, RED, ORANGE, WHITE = (0, 200, 0), (0, 0, 255), (0, 165, 255), (255, 255, 255)
+
+SMOOTHING = 0.2  # seconds for the One Euro filter to smooth the cursor movement
+MAX_SPEED = 900  # px/sec, to avoid huge jumps if the gaze model fails for a frame
 
 
 def main():
     if not MODEL_PATH.exists():
-        raise SystemExit("No gaze model found. Run `python calibration.py` and then "
-                         "`python gaze_boundary.py` first.")
+        raise SystemExit(
+            "No gaze model found. Run `python calibration.py` and then "
+            "`python gaze_boundary.py` first."
+        )
 
     mapper = GazeMapper.load(min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
-    screen_w, screen_h = pyautogui.size()  # real pixels (ignores Windows display scaling)
-    screen = mouse_movement.MouseMovement(screen_w, screen_h, SENSITIVITY, MIN_MOVE_PX)
+    screen_w, screen_h = (
+        pyautogui.size()
+    )  # real pixels (ignores Windows display scaling)
+    screen = mouse_movement.MouseMovement(
+        screen_w,
+        screen_h,
+        SENSITIVITY,
+        MIN_MOVE_PX,
+        smoothing=SMOOTHING,
+        max_speed=MAX_SPEED,
+    )
     tracker = FaceTracker()
 
     controlling = False  # start paused so the mouse isn't grabbed right away
@@ -62,17 +78,34 @@ def main():
 
             if gaze is None:
                 status, color = "no face / blinking", ORANGE
+                screen.pause()  # reset time so the next gaze jump isn't huge
             elif not gaze["on_screen"]:
                 status, color = "OFF SCREEN - cursor stays put", RED
+                screen.pause()  # reset time so the next gaze jump isn't huge
             else:
                 status, color = f"ON SCREEN ({gaze['x']:.2f}, {gaze['y']:.2f})", GREEN
                 if controlling:
                     screen.move_to_gaze(gaze["x"], gaze["y"])
+                else:
+                    screen.pause()  # reset time so the next gaze jump isn't huge
 
-            mode = "MOUSE CONTROL ON  (SPACE = pause)" if controlling else "MOUSE PAUSED  (SPACE = start)"
-            cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-            cv2.putText(frame, mode, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        GREEN if controlling else WHITE, 2)
+            mode = (
+                "MOUSE CONTROL ON  (SPACE = pause)"
+                if controlling
+                else "MOUSE PAUSED  (SPACE = start)"
+            )
+            cv2.putText(
+                frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2
+            )
+            cv2.putText(
+                frame,
+                mode,
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                GREEN if controlling else WHITE,
+                2,
+            )
             cv2.imshow("Eye mouse", frame)
 
             key = cv2.waitKey(1) & 0xFF
