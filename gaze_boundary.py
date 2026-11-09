@@ -1,40 +1,27 @@
 """
-Fit a gaze -> screen mapping from calibration data, and use it live.
+Fits a model from the calibration data that maps where your eyes are looking
+to a position on the screen. also decides if you're looking on or off the screen.
 
-Fit (uses the newest calibration CSV, or one you pass in):
-    python gaze_boundary.py
-    python gaze_boundary.py calibration_data/calibration_20261104_144608.csv
-    python gaze_boundary.py --eyes-only        # old model without head pose (to compare)
+    python gaze_boundary.py #fit on the newest calibration
+    python gaze_boundary.py calibration_data/calibration_<date>_<time>.csv #fit on a specific one
+    python gaze_boundary.py --live #test it with the webcam
+    --eyes-only and --linear fit the older simpler models to compare
 
-Try it live with the webcam (needs a fitted model first):
-    python gaze_boundary.py --live
+features used for each frame:
+    look_right, look_up: from mediapipe's eye blendshapes
+    head_yaw, head_pitch: head rotation in degrees from the head pose matrix
+head rotation is needed bc if you turn your head while looking at the same spot
+your eyes rotate the other way, so eyes alone would think you looked somewhere else.
 
-How it works
-------------
-1. Features per frame:
-     look_right, look_up   from MediaPipe's eye blendshapes (eyes relative to the face)
-     head_yaw, head_pitch  head rotation in degrees, from the head pose matrix
-   Head rotation is needed because when you turn your head while looking at the
-   same spot, your eyes rotate the other way -- eyes alone would then say you're
-   looking somewhere else.
-2. Fit: least squares on every ON-screen frame (not just per-target averages,
-   so head movements during calibration teach the head correction).
-   The default model is curved (quadratic): besides
-       screen_x = a*look_right + b*look_up + c*head_yaw + d*head_pitch + ...
-   it also has squares and products (look_right*head_yaw, head_yaw**2, ...).
-   A straight line only works for small head turns; with bigger ones the
-   relationship bends. (--linear fits the straight-line model, to compare.)
-   Tested alternatives that did NOT help: iris position relative to the nose,
-   nose bridge, brows, forehead, chin, face sides, eye corners, whole face.
-3. Bounding box: on screen  <=>  0 <= screen_x <= 1  and  0 <= screen_y <= 1
-   (plus a small margin). The off-screen targets are only used to CHECK the box,
-   because their labels (-0.2 / 1.2) are rough guesses.
-4. Live: the position is smoothed with a One Euro filter -- heavy smoothing when
-   the eyes are still (less jitter), light smoothing when they jump (less lag).
+the model is quadratic bc a straight line only worked for small head turns. 
+it's fit on all the on screen frames. on screen means the predicted x and y are both between 0 and 1 with a small margin.
+off screen targets are only used to check it since their positions are rough guesses.
 """
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import math
 import time
@@ -46,20 +33,18 @@ import numpy as np
 CALIBRATION_DIR = Path(__file__).with_name("calibration_data")
 MODEL_PATH = CALIBRATION_DIR / "gaze_model.json"
 
-BLINK_THRESHOLD = 0.5  # eyeBlink score above this = eyes closed, frame is ignored
-DEFAULT_MARGIN = 0.03  # extra room around the screen (fraction of screen size)
-SWITCH_FRAMES = 5      # frames in a row needed to switch on <-> off screen
+BLINK_THRESHOLD = 0.5 #frames with eyeBlink above this get ignored
+DEFAULT_MARGIN = 0.03 #extra room around the screen
+SWITCH_FRAMES = 5 #frames in a row needed to switch between on and off screen
 
-# One Euro filter settings (tested on the calibration recording):
-#   lower MIN_CUTOFF = less jitter when still, but more lag
-#   higher BETA      = follows fast eye jumps quicker, but a bit more jitter
+#One Euro filter settings. lower min cutoff = less jitter but more lag,
+#higher beta = follows quick eye movements faster but more jitter
 FILTER_MIN_CUTOFF = 0.5
 FILTER_BETA = 0.5
 
 EYE_FEATURES = ["look_right", "look_up"]
 HEAD_FEATURES = ["head_yaw", "head_pitch"]
 
-# the blendshapes the gaze features are built from
 BLENDSHAPES_USED = [
     "eyeLookInLeft", "eyeLookOutLeft", "eyeLookInRight", "eyeLookOutRight",
     "eyeLookUpLeft", "eyeLookUpRight", "eyeLookDownLeft", "eyeLookDownRight",
@@ -67,19 +52,17 @@ BLENDSHAPES_USED = [
 ]
 
 
-# ---------------------------------------------------------------- features
+#features
 
 def is_blinking(scores):
-    """scores: dict of blendshape name -> score (0..1)."""
     return max(scores["eyeBlinkLeft"], scores["eyeBlinkRight"]) > BLINK_THRESHOLD
 
 
 def gaze_features(scores):
-    """Turn blendshape scores into two gaze numbers: (look_right, look_up).
+    """turns the blendshape scores into (look_right, look_up).
 
-    Both eyes move the same way, so e.g. "looking right" = left eye looks
-    in (toward the nose) + right eye looks out. Exact sign/direction doesn't
-    matter -- the fit learns it (your camera is mirrored, for example).
+    looking right means the left eye looks in and the right eye looks out.
+    the sign doesn't really matter since the fit figures it out.
     """
     look_right = (scores["eyeLookInLeft"] + scores["eyeLookOutRight"]) \
                - (scores["eyeLookOutLeft"] + scores["eyeLookInRight"])
@@ -89,18 +72,15 @@ def gaze_features(scores):
 
 
 def head_angles(fx, fy, fz):
-    """Head yaw and pitch in degrees, from the direction the face points.
-
-    (fx, fy, fz) is the third column of the 4x4 head pose matrix
-    (m02, m12, m22): the face's forward axis in camera coordinates.
-    """
+    """head yaw and pitch in degrees. (fx, fy, fz) is the third column of the head pose
+    matrix (m02, m12, m22), which is the direction the face is pointing"""
     yaw = math.degrees(math.atan2(fx, fz))
     pitch = math.degrees(math.atan2(fy, math.hypot(fx, fz)))
     return yaw, pitch
 
 
 def features_from_result(result):
-    """Live MediaPipe result -> dict of all features, or None if no face / blinking."""
+    """gets the features from a live mediapipe result. None if no face or blinking"""
     if result is None or not result.face_blendshapes:
         return None
     scores = {shape.category_name: shape.score for shape in result.face_blendshapes[0]}
@@ -113,14 +93,12 @@ def features_from_result(result):
     return feats
 
 
-# ---------------------------------------------------------------- smoothing
+#smoothing
 
 class OneEuroFilter:
-    """Adaptive low-pass filter for one number (Casiez et al., 2012).
-
-    Smooths a lot when the value barely changes (removes jitter), and less
-    when it changes fast (so quick eye jumps don't lag behind).
-    """
+    """One Euro filter (Casiez et al. 2012). smooths a lot when the value is
+    barely changing and less when it changes fast, so there's less jitter
+    without the cursor lagging behind quick eye movements."""
 
     def __init__(self, min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
@@ -141,29 +119,59 @@ class OneEuroFilter:
             return x
         dt = max(t - self._t, 1e-3)
         self._t = t
-        # how fast is the value changing? (itself smoothed)
+        #how fast the value is changing (also smoothed)
         a_d = self._alpha(dt, self.d_cutoff)
         self._dx = a_d * (x - self._x) / dt + (1 - a_d) * self._dx
-        # faster change -> higher cutoff -> less smoothing
+        #faster change means less smoothing
         a = self._alpha(dt, self.min_cutoff + self.beta * abs(self._dx))
         self._x = a * x + (1 - a) * self._x
         return self._x
 
 
-# ---------------------------------------------------------------- fitting
+#fitting
+
+def is_complete_calibration(csv_path):
+    """False if the calibration was stopped early with ESC"""
+    info_path = Path(csv_path).with_suffix(".json")
+    try:
+        info = json.loads(info_path.read_text())
+        return info.get("targets_completed", 0) >= info.get("targets_total", 0)
+    except (OSError, json.JSONDecodeError):
+        return True  #no json file, assume it's fine
+
 
 def newest_calibration_csv():
-    files = sorted(CALIBRATION_DIR.glob("calibration_*.csv"))  # names sort by date
+    """newest complete calibration. file names have the date and time so sorting works"""
+    files = [f for f in sorted(CALIBRATION_DIR.glob("calibration_*.csv")) if is_complete_calibration(f)]
     if not files:
-        raise SystemExit(f"No calibration CSV found in {CALIBRATION_DIR}. Run calibration.py first.")
+        raise SystemExit(f"No complete calibration found in {CALIBRATION_DIR}. Run calibration.py first.")
     return files[-1]
 
 
-def load_frames(csv_path):
-    """Read the calibration CSV -> list of frames with all features.
+def ensure_model_is_current(margin=DEFAULT_MARGIN):
+    """refits the model if there's a newer calibration than the one it used, or if
+    there's no model or it's broken. main.py calls this when it starts."""
+    newest = newest_calibration_csv()
+    source = None
+    if MODEL_PATH.exists():
+        try:
+            source = json.loads(MODEL_PATH.read_text()).get("source_csv")
+        except (OSError, json.JSONDecodeError):
+            pass  #broken file (like from a merge conflict) so refit
+    if source == newest.name:
+        return
+    print(f"Fitting the gaze model on the newest calibration ({newest.name})...")
+    report = io.StringIO()
+    with contextlib.redirect_stdout(report):  #full report is long so only print the main numbers
+        fit_and_save(newest, margin)
+    for line in report.getvalue().splitlines():
+        if line.startswith(("Typical error", "On-screen frames", "Off-screen frames")):
+            print("  " + line)
 
-    Skips frames with no face and frames where the user blinked.
-    """
+
+def load_frames(csv_path):
+    """reads a calibration csv into a list of frames with features.
+    skips frames with no face or a blink"""
     frames = []
     no_face = blinks = 0
     with open(csv_path, newline="") as f:
@@ -196,14 +204,11 @@ def load_frames(csv_path):
 
 
 def design_row(feats, feature_names, center=None, degree=1):
-    """The model's input terms for one frame.
+    """the terms that go into the model for one frame.
 
-    degree 1 (straight-line model): the features, then a 1 for the constant.
-    degree 2 (curved model): also every square and pair product, e.g.
-        look_right**2, look_right*head_yaw, ... -- this lets the fit bend, which
-        matters once the head turns more than a few degrees.
-    Features are centered first (minus their typical value) so the squares
-    measure "how far from normal" rather than raw size.
+    degree 1 is just the features plus a 1 for the constant.
+    degree 2 also adds every square and product of two features.
+    features get centered first so the squares mean how far from normal you are.
     """
     center = center or {}
     base = [feats[n] - center.get(n, 0.0) for n in feature_names]
@@ -216,12 +221,8 @@ def design_row(feats, feature_names, center=None, degree=1):
 
 
 def fit_mapping(frames, feature_names, degree=2):
-    """Least-squares fit of screen_x and screen_y from every ON-screen frame.
-
-    Returns (coef_x, coef_y, center): one coefficient per model term (see
-    design_row), and the typical value of each feature (the median while
-    looking at the normal dots with the head still).
-    """
+    """least squares fit of screen x and y using all the on screen frames.
+    returns coef_x, coef_y, and center (the median of each feature with the head still)"""
     on = [f for f in frames if f["on_screen"]]
     if len({f["label"] for f in on}) < 3:
         raise SystemExit("Need at least 3 on-screen targets to fit.")
@@ -234,27 +235,21 @@ def fit_mapping(frames, feature_names, degree=2):
 
 
 def describe_position(x, y):
-    """(-0.2, -0.2) -> 'above-left' etc., for readable reports."""
+    #ex. (-0.2, -0.2) gives "above-left"
     vert = "above" if y < 0 else "below" if y > 1 else ""
     horiz = "left" if x < 0 else "right" if x > 1 else ""
     return "-".join(p for p in (vert, horiz) if p) or "on screen"
 
 
-# ---------------------------------------------------------------- live use
+#live
 
 class GazeMapper:
-    """Turns live MediaPipe results into a screen position + on/off screen.
+    """Takes live mediapipe results and gives a screen position and whether
+    you're looking on screen. main.py uses this.
 
-    Usage:
-        mapper = GazeMapper.load()
-        out = mapper.update(result)     # result from detector.detect(...)
-        if out is not None and out["on_screen"]:
-            px, py = out["x"] * screen_w, out["y"] * screen_h
-
-    The image must be flipped the same way as during calibration
-    (calibration.py and main.py both flip it), and for the head features the
-    detector needs output_facial_transformation_matrixes=True
-    (calibration.FaceTracker has that).
+    the camera image has to be flipped the same way as in calibration, and the
+    detector needs output_facial_transformation_matrixes=True for the head features.
+    calibration.FaceTracker does both.
     """
 
     def __init__(self, coef_x, coef_y, features=EYE_FEATURES, center=None, degree=1,
@@ -270,21 +265,21 @@ class GazeMapper:
         self._filter_x = OneEuroFilter(min_cutoff, beta)
         self._filter_y = OneEuroFilter(min_cutoff, beta)
 
-        self.on_screen = True  # current (debounced) state
-        self._disagree = 0     # frames in a row that disagree with the state
+        self.on_screen = True
+        self._disagree = 0 #frames in a row that disagree with on_screen
 
     @classmethod
     def load(cls, path=MODEL_PATH, **kwargs):
         model = json.loads(Path(path).read_text())
         kwargs.setdefault("margin", model.get("margin", DEFAULT_MARGIN))
-        # older models (before head pose / the curved model) default to the old behavior
+        #older model files don't have these so use the old defaults
         kwargs.setdefault("features", model.get("features_used", EYE_FEATURES))
         kwargs.setdefault("center", model.get("center", {}))
         kwargs.setdefault("degree", model.get("degree", 1))
         return cls(model["coef_x"], model["coef_y"], **kwargs)
 
     def to_screen(self, feats):
-        """Feature dict -> screen position as fractions (0..1 = on screen)."""
+        #screen position as fractions, 0 to 1 is on screen
         v = np.array(design_row(feats, self.features, self.center, self.degree))
         return float(self.coef_x @ v), float(self.coef_y @ v)
 
@@ -293,13 +288,10 @@ class GazeMapper:
         return -m <= x <= 1 + m and -m <= y <= 1 + m
 
     def update(self, result, t=None):
-        """Feed one MediaPipe result. Returns None if no face or blinking,
-        otherwise {"x", "y", "on_screen", "inside_now"}.
-
-        x, y       smoothed screen position (fractions; can be <0 or >1)
-        inside_now raw check for this frame only
-        on_screen  debounced: only flips after SWITCH_FRAMES frames in a row,
-                   so it doesn't flicker at the edges
+        """call once per frame. returns None if no face or blinking, otherwise a dict with
+        x, y: smoothed screen position (can go below 0 or above 1)
+        inside_now: if this frame alone is on screen
+        on_screen: only changes after SWITCH_FRAMES frames in a row so it doesnt flicker at the edges
         """
         feats = features_from_result(result)
         if feats is None or any(n not in feats for n in self.features):
@@ -321,10 +313,10 @@ class GazeMapper:
         return {"x": x, "y": y, "on_screen": self.on_screen, "inside_now": inside_now}
 
 
-# ---------------------------------------------------------------- report
+#report
 
 def evaluate(frames, mapper):
-    """Print how well the box separates on- and off-screen, and return a summary."""
+    """prints how accurate the model is for each target and overall"""
     print("\nPer target (median predicted position, % of frames classified correctly):")
     print(f"  {'label':22s} {'true (x, y)':>13s}   {'predicted':>13s}   correct")
     by_label = {}
@@ -351,7 +343,7 @@ def evaluate(frames, mapper):
     off = [not i for i, f in zip(inside, frames) if not f["on_screen"]]
     off_acc = float(np.mean(off)) if off else float("nan")
 
-    def typical_error(group):  # median distance from the true target, as % of the screen
+    def typical_error(group):  #median distance from the actual target
         errs = [math.hypot(px - f["x"], py - f["y"])
                 for f in group for px, py in [mapper.to_screen(f)]]
         return float(np.median(errs)) if errs else float("nan")
@@ -383,7 +375,7 @@ def fit_and_save(csv_path, margin, use_head=True, degree=2):
     mapper = GazeMapper(coef_x, coef_y, features=feature_names, center=center,
                         degree=degree, margin=margin)
 
-    # fit quality: error of each on-screen target's median prediction
+    #worst error out of all the on screen targets
     errs = []
     for label in dict.fromkeys(f["label"] for f in frames if f["on_screen"]):
         frs = [f for f in frames if f["label"] == label]
@@ -421,16 +413,15 @@ def fit_and_save(csv_path, margin, use_head=True, degree=2):
 
 
 def run_live(margin):
-    """Webcam test: shows ON/OFF SCREEN and a mini map of where you're looking."""
+    """webcam test that shows ON/OFF SCREEN and a small map of where you're looking"""
     import cv2
-    from calibration import FaceTracker  # same camera + detector setup, same flip
+    from calibration import FaceTracker
 
-    if not MODEL_PATH.exists():
-        raise SystemExit("No gaze model yet -- run `python gaze_boundary.py` first.")
+    ensure_model_is_current(margin)
     mapper = GazeMapper.load(margin=margin)
     tracker = FaceTracker()
 
-    # mini map: shows x and y from -0.5 to 1.5, the screen is the box in the middle
+    #map goes from -0.5 to 1.5, the box in the middle is the screen
     map_w, map_h = 200, 150
     def to_map(x, y):
         mx = int((min(max(x, -0.5), 1.5) + 0.5) / 2 * map_w)

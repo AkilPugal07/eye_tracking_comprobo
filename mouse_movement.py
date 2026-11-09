@@ -1,11 +1,10 @@
-# A library to handle mouse movement based on screen dimensions and sensitivity.
+#handles moving the mouse and clicking
 import math
 import time
 
 import pyautogui
 
-# By default pyautogui sleeps 0.1 s after EVERY call. We move the mouse once per
-# camera frame, so that would cap the whole loop at ~10 fps. Turn it off.
+#pyautogui waits 0.1s after every call by default which slows the loop down to ~10 fps
 pyautogui.PAUSE = 0
 
 
@@ -25,11 +24,11 @@ class MouseMovement:
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.sensitivity = sensitivity
-        self.min_move_px = min_move_px  # ignore jumps smaller than this (less jitter)
-        self.smoothing = smoothing  # 0 = no easing (old behavior: jump straight there)
-        self.max_speed = max_speed  # None = no speed limit
-        self._last_pos = None  # last integer position sent to the OS
-        self._cx = None  # smoothed cursor position, kept as floats
+        self.min_move_px = min_move_px  #ignore movements smaller than this
+        self.smoothing = smoothing  #0 means no easing, jumps straight there
+        self.max_speed = max_speed  #None means no speed limit
+        self._last_pos = None  #last position sent to the mouse
+        self._cx = None  #smoothed cursor position
         self._cy = None
         self._t = None
 
@@ -40,8 +39,7 @@ class MouseMovement:
 
     def _move_clamped(self, x, y):
         """Move to pixel (x, y), kept inside the screen."""
-        # Stay 1 px away from the edges: pyautogui's fail-safe stops the program
-        # (FailSafeException) if the mouse lands exactly in a screen corner.
+        #stays 1px from the edges bc pyautogui fail-safe stops the program if mouse hits a corner
         x, y = self._clamp(x, y)
         ix, iy = int(round(x)), int(round(y))
         if self._last_pos != (ix, iy):
@@ -50,7 +48,7 @@ class MouseMovement:
         self._cx, self._cy = x, y
 
     def _ensure_started(self):
-        """Start the smoothed position from where the cursor really is."""
+        #start from where the cursor actually is
         if self._cx is None:
             self._cx, self._cy = pyautogui.position()
 
@@ -65,16 +63,15 @@ class MouseMovement:
         """
         Move the cursor to where the user is looking.
 
-        gaze_x, gaze_y are screen fractions from gaze_boundary.GazeMapper
-        (0..1 = on screen). Sensitivity stretches eye movement around the screen
-        center: 1.0 = exact, >1 makes the screen edges easier to reach.
+        gaze_x and gaze_y are fractions of the screen from GazeMapper (0 to 1 is on screen).
+        sensitivity >1 makes the edges easier to reach
         """
         t = time.monotonic() if t is None else t
         self._ensure_started()
         if self._t is None:
             self._t = t
             return
-        dt = min(max(t - self._t, 0.1), 0.1)  # cap dt to avoid huge jumps after a pause
+        dt = min(max(t - self._t, 0.0), 0.1)  #cap dt so theres no huge jump after a pause
         self._t = t
 
         fx = 0.5 + (gaze_x - 0.5) * self.sensitivity
@@ -104,7 +101,7 @@ class MouseMovement:
         """
         Pause the mouse movement, resetting the internal time to avoid jumps when resuming.
         """
-        self._t = None  # reset time so the next gaze jump isn't huge
+        self._t = None
 
     def right_click(self, has_closed_right_eye):
         """
